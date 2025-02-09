@@ -2,13 +2,31 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Enhanced SPH Fluid Simulation with Pressure Projection</title>
+    <title>SPH Fluid Simulation with Thousands of Particles</title>
     <style>
-        html, body { margin: 0; padding: 0; overflow: hidden; background: #000; }
-        canvas { display: block; }
+        html, body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background: #000;
+        }
+        /* Canvas fills the screen */
+        canvas {
+            display: block;
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 0;
+        }
+        /* Fixed UI controls at top-left */
         #controls {
-            position: absolute; top: 10px; left: 10px; z-index: 10;
-            background: rgba(255,255,255,0.8); padding: 5px; border-radius: 4px;
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            z-index: 1000;
+            background: rgba(255,255,255,0.8);
+            padding: 5px 10px;
+            border-radius: 4px;
             font-family: sans-serif;
         }
     </style>
@@ -27,6 +45,7 @@
     const canvas = document.getElementById('canvas');
     const ctx = canvas.getContext('2d');
 
+    // Resize canvas to fill the window
     function resizeCanvas() {
         canvas.width = window.innerWidth;
         canvas.height = window.innerHeight;
@@ -35,6 +54,7 @@
     window.addEventListener('resize', resizeCanvas);
     resizeCanvas();
 
+    // Particle class
     class Particle {
         constructor(x, y, radius, vx, vy) {
             this.x = x;
@@ -45,7 +65,7 @@
             this.mass = Math.PI * radius * radius;
             this.density = this.mass;
             this.pressure = 0;
-            // Temporary values used in the pressure projection step:
+            // Temporary values for pressure projection:
             this.tempX = x;
             this.tempY = y;
             this.tempVx = vx;
@@ -62,34 +82,34 @@
         }
     }
 
+    // Fluid simulation using SPH with a rudimentary pressure projection
     class ParticleFluidSim {
         constructor(canvas, ctx) {
             this.canvas = canvas;
             this.ctx = ctx;
             this.particles = [];
             // Simulation parameters:
-            this.h = 15;                   // Smoothing length / particle radius
-            this.restDensity = 3000;       // Rest density (for pressure projection)
-            this.mu = 500;                 // Viscosity coefficient
-            this.gravity = 1500;           // Gravity force
-            this.damping = 0.99;
-            this.maxParticles = 2500;
+            this.h = 15;             // Particle radius / smoothing length
+            this.restDensity = 300; // Rest density
+            this.mu = 500;           // Viscosity coefficient
+            this.gravity = 1500;     // Gravity force
+            this.damping = 0.999;
+            this.maxParticles = 2500;  // Thousands of particles
             // Grid cell sizes:
             this.sphCellSize = this.h;
             this.particleRadius = this.h;
             this.collisionCellSize = this.particleRadius * 2;
             this.surfaceTension = 0.1;
             // Pressure solver parameters:
-            this.maxPressureIterations = 10;    // Number of pressure iterations per substep
-            this.pressureSolverLambda = 0.0001;   // Tuning parameter (adjust for stability)
+            this.maxPressureIterations = 2;  // Fewer iterations for speed
+            this.pressureSolverLambda = 0.00005;
         }
 
-        // Build a grid for neighbor search; if useTemp is true then use temp positions.
+        // Build a grid for neighbor searches; if useTemp is true then use temporary positions.
         buildGrid(cellSize, useTemp = false) {
             const cols = Math.ceil(canvas.width / cellSize);
             const rows = Math.ceil(canvas.height / cellSize);
-            const grid = new Array(cols * rows);
-            for (let i = 0; i < grid.length; i++) grid[i] = [];
+            const grid = new Array(cols * rows).fill(null).map(() => []);
             for (let i = 0; i < this.particles.length; i++) {
                 const p = this.particles[i];
                 let posX = useTemp ? p.tempX : p.x;
@@ -118,7 +138,7 @@
             return (45 / (Math.PI * Math.pow(h, 6))) * (h - r);
         }
 
-        // Compute external forces (gravity, viscosity, plus mouse repulsion).
+        // Compute external forces (gravity, viscosity, and mouse repulsion)
         computeExternalForces() {
             const forces = new Array(this.particles.length);
             for (let i = 0; i < this.particles.length; i++) {
@@ -127,7 +147,7 @@
                 // Gravity:
                 forces[i].fy += p.mass * this.gravity;
             }
-            // Use grid to compute viscosity forces:
+            // Viscosity forces using a grid:
             const { grid, cols, rows } = this.buildGrid(this.sphCellSize, false);
             for (let i = 0; i < this.particles.length; i++) {
                 const p = this.particles[i];
@@ -153,10 +173,10 @@
                         }
                     }
                 }
-                // Mouse repulsion force:
+                // Mouse repulsion:
                 if (mouseDown) {
                     const repulsionRadius = 150;
-                    const repulsionForce = 10000;
+                    const repulsionForce = 1000000;
                     const dx = p.x - mousePos.x;
                     const dy = p.y - mousePos.y;
                     const dist = Math.hypot(dx, dy);
@@ -170,9 +190,8 @@
             return forces;
         }
 
-        // A basic pressure projection step (PCISPH–style) that tries to enforce near incompressibility.
+        // Rudimentary pressure projection step.
         pressureProjection(dt) {
-            // 1. Compute tentative velocities/positions from external forces.
             const forces = this.computeExternalForces();
             for (let i = 0; i < this.particles.length; i++) {
                 const p = this.particles[i];
@@ -180,13 +199,10 @@
                 p.tempVy = p.vy + (forces[i].fy / p.mass) * dt;
                 p.tempX = p.x + p.tempVx * dt;
                 p.tempY = p.y + p.tempVy * dt;
-                p.tempPressure = 0; // reset pressure
+                p.tempPressure = 0;
             }
-
-            // 2. Iteratively adjust pressure to reduce density error.
             for (let iter = 0; iter < this.maxPressureIterations; iter++) {
                 const { grid, cols, rows } = this.buildGrid(this.h, true);
-                // Compute local density error for each particle.
                 for (let i = 0; i < this.particles.length; i++) {
                     const p = this.particles[i];
                     let density = 0;
@@ -209,11 +225,8 @@
                     }
                     p.tempDensity = density;
                     const densityError = density - this.restDensity;
-                    // Adjust pressure (a simple proportional update).
                     p.tempPressure += this.pressureSolverLambda * densityError;
                 }
-
-                // 3. Compute pressure gradient forces and update tentative velocities.
                 for (let i = 0; i < this.particles.length; i++) {
                     const p = this.particles[i];
                     let gradForceX = 0;
@@ -233,7 +246,6 @@
                                 const dyPos = p.tempY - pj.tempY;
                                 const r = Math.hypot(dxPos, dyPos);
                                 if (r > 0 && r < this.h) {
-                                    // Use symmetric pressure contribution.
                                     const pressureTerm = (p.tempPressure + pj.tempPressure) / (2 * pj.tempDensity);
                                     const grad = this.spikyGradient(r, this.h);
                                     gradForceX += -pj.mass * pressureTerm * grad * (dxPos / r);
@@ -242,16 +254,12 @@
                             }
                         }
                     }
-                    // Update tentative velocities with pressure gradient force.
                     p.tempVx -= (gradForceX / p.mass) * dt;
                     p.tempVy -= (gradForceY / p.mass) * dt;
-                    // Recompute tentative positions.
                     p.tempX = p.x + p.tempVx * dt;
                     p.tempY = p.y + p.tempVy * dt;
                 }
             }
-
-            // 4. Commit the tentative velocities and update positions.
             for (let i = 0; i < this.particles.length; i++) {
                 const p = this.particles[i];
                 p.vx = p.tempVx;
@@ -261,14 +269,13 @@
             }
         }
 
-        // Collision resolution using a grid-based approach.
+        // Collision resolution using a grid.
         resolveCollisions() {
             const { grid, cols, rows } = this.buildGrid(this.collisionCellSize);
-            const iterations = 3;
+            const iterations = 5; // Increased iterations for more robust correction
             for (let iter = 0; iter < iterations; iter++) {
                 for (let index = 0; index < grid.length; index++) {
                     const cell = grid[index];
-                    // Resolve collisions within this cell.
                     for (let i = 0; i < cell.length; i++) {
                         const p = this.particles[cell[i]];
                         for (let j = i + 1; j < cell.length; j++) {
@@ -276,7 +283,6 @@
                             this.checkAndResolve(p, q);
                         }
                     }
-                    // Also check neighboring cells.
                     const col = index % cols;
                     const row = Math.floor(index / cols);
                     for (let dy = -1; dy <= 1; dy++) {
@@ -307,7 +313,8 @@
             if (dist < minDist && dist > 0) {
                 const nx = dx / dist;
                 const ny = dy / dist;
-                const overlap = (minDist - dist) * 0.5;
+                // Increase the correction factor to reduce overlap
+                const overlap = (minDist - dist) * 0.8;
                 const totalMass = p.mass + q.mass;
                 p.x -= nx * overlap * (q.mass / totalMass);
                 p.y -= ny * overlap * (q.mass / totalMass);
@@ -339,42 +346,18 @@
 
         step(dt) {
             dt = Math.min(dt, 0.016);
-            const subSteps = 2;
-            const subDt = dt / subSteps;
-            for (let s = 0; s < subSteps; s++) {
-                if (this.particles.length < this.maxParticles) this.spawnParticle();
-                // Run pressure projection (which internally uses external forces including mouse repulsion).
-                this.pressureProjection(subDt);
-
-                // Extra positional correction when the mouse is pressed.
-                if (mouseDown) {
-                    const repulsionRadius = 250;
-                    for (let i = 0; i < this.particles.length; i++) {
-                        const p = this.particles[i];
-                        const dx = p.x - mousePos.x;
-                        const dy = p.y - mousePos.y;
-                        const d = Math.hypot(dx, dy);
-                        if (d < repulsionRadius && d > 0) {
-                            const correction = (repulsionRadius - d) * 0.05;
-                            p.x += (dx / d) * correction;
-                            p.y += (dy / d) * correction;
-                        }
-                    }
-                }
-
-                // Resolve collisions.
-                this.resolveCollisions();
-
-                // Enforce boundary constraints.
-                for (let i = 0; i < this.particles.length; i++) {
-                    const p = this.particles[i];
-                    if (p.x < p.radius) { p.x = p.radius; p.vx *= -0.3; }
-                    if (p.x > canvas.width - p.radius) { p.x = canvas.width - p.radius; p.vx *= -0.3; }
-                    if (p.y < p.radius) { p.y = p.radius; p.vy *= -0.3; }
-                    if (p.y > canvas.height - p.radius) {
-                        p.y = canvas.height - p.radius;
-                        if (p.vy > 0) p.vy = 0;
-                    }
+            if (this.particles.length < this.maxParticles) this.spawnParticle();
+            this.pressureProjection(dt);
+            this.resolveCollisions();
+            // Enforce boundaries (with a slight bounce at the bottom)
+            for (let i = 0; i < this.particles.length; i++) {
+                const p = this.particles[i];
+                if (p.x < p.radius) { p.x = p.radius; p.vx *= -0.3; }
+                if (p.x > canvas.width - p.radius) { p.x = canvas.width - p.radius; p.vx *= -0.3; }
+                if (p.y < p.radius) { p.y = p.radius; p.vy *= -0.3; }
+                if (p.y > canvas.height - p.radius) {
+                    p.y = canvas.height - p.radius;
+                    if (p.vy > 0) p.vy *= -0.5;
                 }
             }
         }
@@ -393,16 +376,25 @@
         currentSim = new ParticleFluidSim(canvas, ctx);
     }
     simModeSelect.addEventListener('change', initSimulation);
-    document.getElementById('reset').addEventListener('click', () => { currentSim.particles = []; });
+    document.getElementById('reset').addEventListener('click', () => {
+        currentSim.particles = [];
+    });
 
+    // Update mouse coordinates relative to the canvas using getBoundingClientRect.
     let mouseDown = false;
     let mousePos = { x: 0, y: 0 };
-    canvas.addEventListener('mousedown', e => {
+    canvas.addEventListener('mousedown', function(e) {
+        const rect = canvas.getBoundingClientRect();
         mouseDown = true;
-        mousePos = { x: e.clientX, y: e.clientY };
+        mousePos = { x: e.clientX - rect.left, y: e.clientY - rect.top };
     });
-    canvas.addEventListener('mouseup', () => { mouseDown = false; });
-    canvas.addEventListener('mousemove', e => { mousePos = { x: e.clientX, y: e.clientY }; });
+    canvas.addEventListener('mouseup', function(e) {
+        mouseDown = false;
+    });
+    canvas.addEventListener('mousemove', function(e) {
+        const rect = canvas.getBoundingClientRect();
+        mousePos = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    });
 
     let lastTime = 0;
     function animate(timestamp) {
@@ -410,7 +402,6 @@
         lastTime = timestamp;
         currentSim.step(dt);
         currentSim.render();
-        // Draw an FPS counter.
         ctx.fillStyle = 'white';
         ctx.font = '16px sans-serif';
         ctx.fillText('FPS: ' + Math.round(1 / dt), canvas.width - 80, 20);
