@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <title>Enhanced SPH Fluid Simulation</title>
+    <style>
+        html, body { margin: 0; padding: 0; overflow: hidden; background: #000; }
+        canvas { display: block; }
+        #controls {
+            position: absolute; top: 10px; left: 10px; z-index: 10;
+            background: rgba(255,255,255,0.8); padding: 5px; border-radius: 4px;
+            font-family: sans-serif;
+        }
+    </style>
+</head>
+<body>
+<div id="controls">
+    <label for="simMode">Simulation Mode:</label>
+    <select id="simMode">
+        <option value="particle">SPH Fluid</option>
+    </select>
+    <button id="reset">Reset</button>
+</div>
+<canvas id="canvas"></canvas>
+<script>
+    let currentSim = null;
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+
+    function resizeCanvas() {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        if (currentSim?.onResize) currentSim.onResize();
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    class Particle {
+        constructor(x, y, radius, vx, vy) {
+            this.x = x;
+            this.y = y;
+            this.radius = radius;
+            this.vx = vx;
+            this.vy = vy;
+            this.mass = Math.PI * radius * radius;
+            this.density = this.mass; // initial density
+            this.pressure = 0;
+        }
+        update(dt, forceX, forceY, damping) {
+            this.vx += (forceX / this.mass) * dt;
+            this.vy += (forceY / this.mass) * dt;
+            this.x += this.vx * dt;
+            this.y += this.vy * dt;
+            this.vx *= damping;
+            this.vy *= damping;
+        }
+        render(ctx) {
+            const speed = Math.hypot(this.vx, this.vy);
+            ctx.fillStyle = `hsl(210, 100%, ${50 + Math.min(speed * 0.1, 30)}%)`;
+            ctx.beginPath();
+            // Render at 60% of the defined radius for visual appeal.
+            ctx.arc(this.x, this.y, this.radius * 0.6, 0, Math.PI * 2);
+            ctx.fill();
+        }
+    }
+
+    class ParticleFluidSim {
+        constructor(canvas, ctx) {
+            this.canvas = canvas;
+            this.ctx = ctx;
+            this.particles = [];
+            // Realistic water parameters with particle size 15:
+            this.h = 15;                   // Smoothing length and particle radius
+            this.restDensity = 3000;       // Rest density
+            this.k = 15000;                // Pressure stiffness
+            this.mu = 500;                 // Viscosity coefficient
+            this.gravity = 1500;           // Gravity force
+            this.damping = 0.99;
+            this.maxParticles = 2500;      // Up to 2,500 particles
+            // For SPH, use a grid cell size equal to h.
+            this.sphCellSize = this.h;
+            // For collisions, use a grid cell size equal to particle diameter.
+            this.particleRadius = this.h;
+            this.collisionCellSize = this.particleRadius * 2;
+            this.surfaceTension = 0.1;
+        }
+
+        // Build a grid using a plain array for a given cell size.
+        buildGrid(cellSize) {
+            const cols = Math.ceil(canvas.width / cellSize);
+            const rows = Math.ceil(canvas.height / cellSize);
+            const grid = new Array(cols * rows);
+            for (let i = 0; i < grid.length; i++) {
+                grid[i] = [];
+            }
+            for (let i = 0; i < this.particles.length; i++) {
+                const p = this.particles[i];
+                let col = Math.floor(p.x / cellSize);
+                let row = Math.floor(p.y / cellSize);
+                col = Math.max(0, Math.min(col, cols - 1));
+                row = Math.max(0, Math.min(row, rows - 1));
+                grid[row * cols + col].push(i);
+            }
+            return { grid, cols, rows };
+        }
+
+        // SPH kernel functions:
+        poly6(r, h) {
+            if (r > h) return 0;
+            const h2 = h * h;
+            const r2 = r * r;
+            return (315 / (64 * Math.PI * Math.pow(h, 9))) * Math.pow(h2 - r2, 3);
+        }
+        spikyGradient(r, h) {
+            if (r >= h || r === 0) return 0;
+            return (-45 / (Math.PI * Math.pow(h, 6))) * Math.pow(h - r, 2) / r;
+        }
+        viscosityLaplacian(r, h) {
+            if (r > h) return 0;
+            return (45 / (Math.PI * Math.pow(h, 6))) * (h - r);
+        }
+
+        computeDensityPressure() {
+            const { grid, cols, rows } = this.buildGrid(this.sphCellSize);
+            for (let i = 0; i < this.particles.length; i++) {
+                const p = this.particles[i];
+                p.density = 0;
+                const col = Math.floor(p.x / this.sphCellSize);
+                const row = Math.floor(p.y / this.sphCellSize);
+                for (let dy = -1; dy <= 1; dy++) {
+                    for (let dx = -1; dx <= 1; dx++) {
+                        const ncol = col + dx;
+                        const nrow = row + dy;
+                        if (ncol < 0 || ncol >= cols || nrow < 0 || nrow >= rows) continue;
+                        const cell = grid[nrow * cols + ncol];
+                        for (let j = 0; j < cell.length; j++) {
+                            const pj = this.particles[cell[j]];
+                            const r = Math.hypot(p.x - pj.x, p.y - pj.y);
+                            p.density += pj.mass * this.poly6(r, this.h);
+                        }
+                    }
+                }
+                p.pressure = this.k * Math.max(p.density - this.restDensity, 0);
+            }
+        }
+
+        computeForces() {
+            const forces = new Array(this.particles.length);
+            for (let i = 0; i < this.particles.length; i++) {
+                forces[i] = { fx: 0, fy: 0 };
+            }
+            const { grid, cols, rows } = this.buildGrid(this.sphCellSize);
+            for (let i = 0; i < this.particles.length; i++) {
+                const p = this.particles[i];
+                forces[i].fy += p.mass * this.gravity; // Gravity
+                const col = Math.floor(p.x / this.sphCellSize);
+                const row = Math.floor(p.y / this.sphCellSize);
+                let colorFieldGrad = { x: 0, y: 0 };
+                let colorFieldLap = 0;
+                for (let dy = -1; dy <= 1; dy++) {
+                    for (let dx = -1; dx <= 1; dx++) {
+                        const ncol = col + dx;
+                        const nrow = row + dy;
+                        if (ncol < 0 || ncol >= cols || nrow < 0 || nrow >= rows) continue;
+                        const cell = grid[nrow * cols + ncol];
+                        for (let j = 0; j < cell.length; j++) {
+                            if (cell[j] === i) continue;
+                            const pj = this.particles[cell[j]];
+                            const dxPos = pj.x - p.x;
+                            const dyPos = pj.y - p.y;
+                            const r = Math.hypot(dxPos, dyPos);
+                            if (r > 0 && r < this.h) {
+                                const pressureForce = -pj.mass * (p.pressure + pj.pressure) /
+                                    (2 * pj.density) * this.spikyGradient(r, this.h);
+                                forces[i].fx += pressureForce * dxPos;
+                                forces[i].fy += pressureForce * dyPos;
+                                const viscForce = this.mu * pj.mass * this.viscosityLaplacian(r, this.h) / pj.density;
+                                forces[i].fx += viscForce * (pj.vx - p.vx);
+                                forces[i].fy += viscForce * (pj.vy - p.vy);
+                                const poly6Val = this.poly6(r, this.h);
+                                colorFieldGrad.x += (pj.mass / pj.density) * poly6Val * dxPos / r;
+                                colorFieldGrad.y += (pj.mass / pj.density) * poly6Val * dyPos / r;
+                                colorFieldLap += (pj.mass / pj.density) * poly6Val;
+                            }
+                        }
+                    }
+                }
+                const tensionForce = -this.surfaceTension * colorFieldLap * Math.hypot(colorFieldGrad.x, colorFieldGrad.y);
+                forces[i].fx += tensionForce * colorFieldGrad.x;
+                forces[i].fy += tensionForce * colorFieldGrad.y;
+            }
+            return forces;
+        }
+
+        // Collision resolution using grid built with collisionCellSize.
+        resolveCollisions() {
+            const { grid, cols, rows } = this.buildGrid(this.collisionCellSize);
+            const iterations = 3; // Fewer iterations for performance
+            for (let iter = 0; iter < iterations; iter++) {
+                for (let index = 0; index < grid.length; index++) {
+                    const cell = grid[index];
+                    // Resolve collisions within the cell.
+                    for (let i = 0; i < cell.length; i++) {
+                        const p = this.particles[cell[i]];
+                        for (let j = i + 1; j < cell.length; j++) {
+                            const q = this.particles[cell[j]];
+                            this.checkAndResolve(p, q);
+                        }
+                    }
+                    // Also check with neighboring cells.
+                    const col = index % cols;
+                    const row = Math.floor(index / cols);
+                    for (let dy = -1; dy <= 1; dy++) {
+                        for (let dx = -1; dx <= 1; dx++) {
+                            if (dx === 0 && dy === 0) continue;
+                            const ncol = col + dx;
+                            const nrow = row + dy;
+                            if (ncol < 0 || ncol >= cols || nrow < 0 || nrow >= rows) continue;
+                            const neighborCell = grid[nrow * cols + ncol];
+                            for (let i = 0; i < cell.length; i++) {
+                                const p = this.particles[cell[i]];
+                                for (let j = 0; j < neighborCell.length; j++) {
+                                    const q = this.particles[neighborCell[j]];
+                                    this.checkAndResolve(p, q);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        checkAndResolve(p, q) {
+            const dx = q.x - p.x;
+            const dy = q.y - p.y;
+            const dist = Math.hypot(dx, dy);
+            const minDist = p.radius + q.radius;
+            if (dist < minDist && dist > 0) {
+                const nx = dx / dist;
+                const ny = dy / dist;
+                const overlap = (minDist - dist) * 0.5;
+                const totalMass = p.mass + q.mass;
+                p.x -= nx * overlap * (q.mass / totalMass);
+                p.y -= ny * overlap * (q.mass / totalMass);
+                q.x += nx * overlap * (p.mass / totalMass);
+                q.y += ny * overlap * (p.mass / totalMass);
+                const dvx = q.vx - p.vx;
+                const dvy = q.vy - p.vy;
+                const dot = dvx * nx + dvy * ny;
+                if (dot < 0) {
+                    const responseCoef = 0.8;
+                    const impulse = (1 + responseCoef) * dot / (1 / p.mass + 1 / q.mass);
+                    p.vx += impulse * nx / p.mass;
+                    p.vy += impulse * ny / p.mass;
+                    q.vx -= impulse * nx / q.mass;
+                    q.vy -= impulse * ny / q.mass;
+                }
+            }
+        }
+
+        spawnParticle() {
+            if (this.particles.length >= this.maxParticles) return;
+            const spawnX = canvas.width / 2 + (Math.random() - 0.5) * canvas.width;
+            const spawnY = canvas.height / 2 + (Math.random() - 0.5) * canvas.height;
+            this.particles.push(new Particle(
+                spawnX, spawnY, this.h,
+                (Math.random() - 0.5) * 30, Math.random() * 30
+            ));
+        }
+
+        step(dt) {
+            dt = Math.min(dt, 0.016);
+            const subSteps = 2; // Fewer substeps for performance
+            const subDt = dt / subSteps;
+            for (let s = 0; s < subSteps; s++) {
+                if (this.particles.length < this.maxParticles) {
+                    this.spawnParticle();
+                }
+                // --- Continuous Repulsion Force While Mouse Is Pressed ---
+                if (mouseDown) {
+                    const repulsionRadius = 150;
+                    const repulsionForce = 10000;
+                    for (let j = 0; j < this.particles.length; j++) {
+                        const p = this.particles[j];
+                        const dx = p.x - mousePos.x;
+                        const dy = p.y - mousePos.y;
+                        const dist = Math.hypot(dx, dy);
+                        if (dist < repulsionRadius && dist > 0) {
+                            const forceMag = repulsionForce * (1 - dist / repulsionRadius);
+                            p.vx += (dx / dist) * forceMag * subDt;
+                            p.vy += (dy / dist) * forceMag * subDt;
+                        }
+                    }
+                }
+                this.computeDensityPressure();
+                const forces = this.computeForces();
+                for (let i = 0; i < this.particles.length; i++) {
+                    this.particles[i].update(subDt, forces[i].fx, forces[i].fy, this.damping);
+                }
+                this.resolveCollisions();
+
+                // --- Extra Positional Correction in the Repulsion Zone ---
+                if (mouseDown) {
+                    const repulsionRadius = 250;
+                    for (let i = 0; i < this.particles.length; i++) {
+                        const p = this.particles[i];
+                        const dx = p.x - mousePos.x;
+                        const dy = p.y - mousePos.y;
+                        const d = Math.hypot(dx, dy);
+                        if (d < repulsionRadius && d > 0) {
+                            const correction = (repulsionRadius - d) * 0.05;
+                            p.x += (dx / d) * correction;
+                            p.y += (dy / d) * correction;
+                        }
+                    }
+                }
+
+                // Boundary constraints – for left, right, top, and bottom.
+                for (let i = 0; i < this.particles.length; i++) {
+                    const p = this.particles[i];
+                    if (p.x < p.radius) {
+                        p.x = p.radius;
+                        p.vx *= -0.3;
+                    }
+                    if (p.x > canvas.width - p.radius) {
+                        p.x = canvas.width - p.radius;
+                        p.vx *= -0.3;
+                    }
+                    if (p.y < p.radius) {
+                        p.y = p.radius;
+                        p.vy *= -0.3;
+                    }
+                    if (p.y > canvas.height - p.radius) {
+                        p.y = canvas.height - p.radius;
+                        // For the bottom, if the particle is moving downward, zero out the velocity.
+                        if (p.vy > 0) p.vy = 0;
+                    }
+                }
+            }
+        }
+
+        render() {
+            this.ctx.clearRect(0, 0, canvas.width, canvas.height);
+            for (let i = 0; i < this.particles.length; i++) {
+                this.particles[i].render(this.ctx);
+            }
+        }
+    }
+
+    // --- Interaction and Setup ---
+    const simModeSelect = document.getElementById('simMode');
+    function initSimulation() {
+        currentSim = new ParticleFluidSim(canvas, ctx);
+    }
+    simModeSelect.addEventListener('change', initSimulation);
+    document.getElementById('reset').addEventListener('click', () => {
+        currentSim.particles = [];
+    });
+
+    let mouseDown = false;
+    let mousePos = { x: 0, y: 0 };
+    canvas.addEventListener('mousedown', e => {
+        mouseDown = true;
+        mousePos = { x: e.clientX, y: e.clientY };
+    });
+    canvas.addEventListener('mouseup', () => {
+        mouseDown = false;
+    });
+    canvas.addEventListener('mousemove', e => {
+        mousePos = { x: e.clientX, y: e.clientY };
+    });
+
+    let lastTime = 0;
+    function animate(timestamp) {
+        const dt = (timestamp - lastTime) / 1000;
+        lastTime = timestamp;
+        currentSim.step(dt);
+        currentSim.render();
+        // Draw FPS counter on the right side.0
+        ctx.fillStyle = 'white';
+        ctx.font = '16px sans-serif';
+        ctx.fillText('FPS: ' + Math.round(1 / dt), canvas.width - 80, 20);
+        requestAnimationFrame(animate);
+    }
+    initSimulation();
+    animate(0);
+</script>
+</body>
+</html>

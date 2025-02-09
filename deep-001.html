@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <title>SPH Fluid Simulation</title>
+    <style>
+        html, body { margin: 0; padding: 0; overflow: hidden; background: #000; }
+        canvas { display: block; }
+        #controls {
+            position: absolute; top: 10px; left: 10px; z-index: 10;
+            background: rgba(255,255,255,0.8); padding: 5px; border-radius: 4px;
+            font-family: sans-serif;
+        }
+    </style>
+</head>
+<body>
+<div id="controls">
+    <label for="simMode">Simulation Mode:</label>
+    <select id="simMode">
+        <option value="particle">SPH Fluid</option>
+    </select>
+    <button id="reset">Reset</button>
+</div>
+<canvas id="canvas"></canvas>
+<script>
+    let currentSim = null;
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+
+    function resizeCanvas() {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        if (currentSim?.onResize) currentSim.onResize();
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    class Particle {
+        constructor(x, y, radius, vx, vy) {
+            this.x = x;
+            this.y = y;
+            this.radius = radius;
+            this.vx = vx;
+            this.vy = vy;
+            this.mass = Math.PI * radius * radius;
+            this.density = 0;
+            this.pressure = 0;
+        }
+
+        update(dt, forceX, forceY, damping) {
+            this.vx += (forceX / this.mass) * dt;
+            this.vy += (forceY / this.mass) * dt;
+            this.x += this.vx * dt;
+            this.y += this.vy * dt;
+            this.vx *= damping;
+            this.vy *= damping;
+        }
+
+        render(ctx) {
+            ctx.fillStyle = `hsl(210, 100%, ${50 + Math.min(this.density/50, 50)}%)`;
+            ctx.beginPath();
+            ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
+            ctx.fill();
+        }
+    }
+
+    class ParticleFluidSim {
+        constructor(canvas, ctx) {
+            this.canvas = canvas;
+            this.ctx = ctx;
+            this.particles = [];
+            // Tuned SPH parameters
+            this.h = 24;                  // Smoothing length
+            this.restDensity = 2000;      // Increased density
+            this.k = 10000;               // Higher pressure constant
+            this.mu = 100;                // Reduced viscosity
+            this.gravity = 1500;          // Stronger gravity
+            this.damping = 0.995;
+            this.maxParticles = 1000;
+            this.cellSize = this.h;
+        }
+
+        poly6(r, h) {
+            if (r > h) return 0;
+            return (315 / (64 * Math.PI * h**9)) * (h**2 - r**2)**3;
+        }
+
+        spikyGradient(r, h) {
+            if (r >= h) return 0;
+            return (-45 / (Math.PI * h**6)) * (h - r)**2;
+        }
+
+        viscosityLaplacian(r, h) {
+            if (r > h) return 0;
+            return (45 / (Math.PI * h**6)) * (h - r);
+        }
+
+        buildGrid() {
+            const grid = new Map();
+            this.particles.forEach((p, i) => {
+                const key = `${Math.floor(p.x/this.cellSize)},${Math.floor(p.y/this.cellSize)}`;
+                grid.has(key) ? grid.get(key).push(i) : grid.set(key, [i]);
+            });
+            return grid;
+        }
+
+        computeDensityPressure() {
+            const grid = this.buildGrid();
+            this.particles.forEach(p => {
+                p.density = p.mass * this.poly6(0, this.h); // Self-density
+                const cx = Math.floor(p.x / this.cellSize);
+                const cy = Math.floor(p.y / this.cellSize);
+
+                for (let dx = -1; dx <= 1; dx++) {
+                    for (let dy = -1; dy <= 1; dy++) {
+                        const key = `${cx+dx},${cy+dy}`;
+                        if (!grid.has(key)) continue;
+                        grid.get(key).forEach(j => {
+                            const pj = this.particles[j];
+                            const r = Math.hypot(p.x-pj.x, p.y-pj.y);
+                            if (r < this.h) p.density += pj.mass * this.poly6(r, this.h);
+                        });
+                    }
+                }
+                p.pressure = this.k * (p.density - this.restDensity);
+            });
+        });
+        }
+
+        computeForces() {
+            const forces = this.particles.map(() => ({ fx: 0, fy: 0 }));
+            const grid = this.buildGrid();
+
+            this.particles.forEach((p, i) => {
+                const cx = Math.floor(p.x / this.cellSize);
+                const cy = Math.floor(p.y / this.cellSize);
+
+                for (let dx = -1; dx <= 1; dx++) {
+                    for (let dy = -1; dy <= 1; dy++) {
+                        const key = `${cx+dx},${cy+dy}`;
+                        if (!grid.has(key)) continue;
+
+                        grid.get(key).forEach(j => {
+                            if (i === j) return;
+                            const pj = this.particles[j];
+                            const dx = pj.x - p.x;
+                            const dy = pj.y - p.y;
+                            const r = Math.hypot(dx, dy);
+
+                            if (r <= this.h) {
+                                // Pressure forces
+                                const pressureForce = -pj.mass * (p.pressure + pj.pressure) /
+                                    (2 * pj.density) * this.spikyGradient(r, this.h);
+                                forces[i].fx += pressureForce * (dx/r);
+                                forces[i].fy += pressureForce * (dy/r);
+
+                                // Viscosity forces
+                                const relVelX = pj.vx - p.vx;
+                                const relVelY = pj.vy - p.vy;
+                                const viscForce = this.mu * pj.mass *
+                                    this.viscosityLaplacian(r, this.h) / pj.density;
+                                forces[i].fx += viscForce * relVelX;
+                                forces[i].fy += viscForce * relVelY;
+                            }
+                        });
+                    }
+                }
+
+                // Gravity
+                forces[i].fy += p.mass * this.gravity;
+            });
+            return forces;
+        }
+
+        resolveCollisions() {
+            const responseCoef = 0.5;
+            const minDist = 8 * 2; // Particle diameter
+
+            this.particles.forEach((p, i) => {
+                this.particles.slice(i+1).forEach(pj => {
+                    const dx = pj.x - p.x;
+                    const dy = pj.y - p.y;
+                    const dist = Math.hypot(dx, dy);
+
+                    if (dist < minDist) {
+                        const nx = dx/dist;
+                        const ny = dy/dist;
+                        const overlap = (minDist - dist)/2;
+
+                        p.x -= nx * overlap;
+                        p.y -= ny * overlap;
+                        pj.x += nx * overlap;
+                        pj.y += ny * overlap;
+
+                        // Velocity response
+                        const dvx = pj.vx - p.vx;
+                        const dvy = pj.vy - p.vy;
+                        const dot = dvx*nx + dvy*ny;
+
+                        if (dot < 0) {
+                            const imp = -dot * responseCoef;
+                            p.vx -= nx * imp;
+                            p.vy -= ny * imp;
+                            pj.vx += nx * imp;
+                            pj.vy += ny * imp;
+                        }
+                    }
+                });
+            });
+        }
+
+        spawnParticle() {
+            if (this.particles.length >= this.maxParticles) return;
+            const radius = 8;
+            const spawnX = canvas.width/2 + (Math.random()-0.5)*80;
+            const spawnY = 100;
+            this.particles.push(new Particle(
+                spawnX, spawnY, radius,
+                (Math.random()-0.5)*50, Math.random()*50
+            ));
+        }
+
+        step(dt) {
+            dt = Math.min(dt, 0.016); // Clamp dt to 60fps
+
+            if (this.particles.length < this.maxParticles) {
+                this.spawnParticle();
+            }
+
+            this.computeDensityPressure();
+            const forces = this.computeForces();
+
+            this.particles.forEach((p, i) => {
+                p.update(dt, forces[i].fx, forces[i].fy, this.damping);
+            });
+
+            this.resolveCollisions();
+
+            // Boundary constraints
+            this.particles.forEach(p => {
+                const bounce = 0.3;
+                if (p.x < p.radius) { p.x = p.radius; p.vx *= -bounce; }
+                if (p.x > canvas.width-p.radius) { p.x = canvas.width-p.radius; p.vx *= -bounce; }
+                if (p.y < p.radius) { p.y = p.radius; p.vy *= -bounce; }
+                if (p.y > canvas.height-p.radius) {
+                    p.y = canvas.height-p.radius;
+                    p.vy = Math.abs(p.vy) < 50 ? 0 : -p.vy*bounce;
+                    p.vx *= 0.9;
+                }
+            });
+        }
+
+        render() {
+            this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+            this.particles.forEach(p => p.render(this.ctx));
+        }
+    }
+
+    // Interaction and setup
+    const simModeSelect = document.getElementById('simMode');
+    function initSimulation() {
+        currentSim = new ParticleFluidSim(canvas, ctx);
+    }
+    simModeSelect.addEventListener('change', initSimulation);
+    document.getElementById('reset').addEventListener('click', () => {
+        currentSim.particles = [];
+    });
+
+    // Mouse interaction
+    let mouseDown = false;
+    canvas.addEventListener('mousedown', () => mouseDown = true);
+    canvas.addEventListener('mouseup', () => mouseDown = false);
+    canvas.addEventListener('mousemove', e => {
+        if (!mouseDown) return;
+        currentSim.particles.forEach(p => {
+            const dx = e.clientX - p.x;
+            const dy = e.clientY - p.y;
+            const dist = Math.hypot(dx, dy);
+            if (dist < 100) {
+                p.vx += dx * 0.1;
+                p.vy += dy * 0.1;
+            }
+        });
+    });
+
+    // Animation loop
+    let lastTime = 0;
+    function animate(timestamp) {
+        const dt = (timestamp - lastTime)/1000;
+        lastTime = timestamp;
+        currentSim.step(dt);
+        currentSim.render();
+        requestAnimationFrame(animate);
+    }
+    initSimulation();
+    animate(0);
+</script>
+</body>
+</html>

@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <title>SPH Fluid Simulation with Particle Collisions</title>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background: #000;
+        }
+        canvas { display: block; }
+        #controls {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            z-index: 10;
+            background: rgba(255,255,255,0.8);
+            padding: 5px;
+            border-radius: 4px;
+            font-family: sans-serif;
+        }
+    </style>
+</head>
+<body>
+<div id="controls">
+    <label for="simMode">Simulation Mode:</label>
+    <select id="simMode">
+        <option value="particle">Particle–based Fluid (SPH Water)</option>
+    </select>
+    <button id="reset">Reset Simulation</button>
+</div>
+<canvas id="canvas"></canvas>
+<script>
+    console.log("Page Loaded");
+
+    let currentSim = null;
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+
+    function resizeCanvas() {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        if (currentSim && currentSim.onResize) {
+            currentSim.onResize();
+        }
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    // -------------------------------------------------------
+    // Particle Class Definition
+    // -------------------------------------------------------
+    class Particle {
+        constructor(x, y, radius, vx, vy) {
+            this.x = x;
+            this.y = y;
+            this.radius = radius;
+            this.vx = vx;
+            this.vy = vy;
+            this.mass = radius * radius;
+            // For SPH:
+            this.density = 0;
+            this.pressure = 0;
+        }
+        render(ctx) {
+            const speed = Math.hypot(this.vx, this.vy);
+            const lightness = 50 + Math.min(speed * 0.1, 30);
+            ctx.fillStyle = `hsl(210, 100%, ${lightness}%)`;
+            ctx.beginPath();
+            ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
+            ctx.fill();
+        }
+    }
+
+    // -------------------------------------------------------
+    // SPH–Based Particle Fluid Simulation with Collision Resolution
+    // -------------------------------------------------------
+    class ParticleFluidSim {
+        constructor(canvas, ctx) {
+            this.canvas = canvas;
+            this.ctx = ctx;
+            this.particles = [];
+            // SPH parameters:
+            this.h = 20;                    // Smoothing length (pixels)
+            this.restDensity = 1000;        // Rest density
+            this.k = 800;                   // Pressure stiffness constant (lowered for gentler repulsion)
+            this.mu = 250;                  // Viscosity coefficient
+
+            // Simulation settings:
+            this.gravity = 300;             // Lower gravity to slow acceleration
+            this.damping = 0.97;            // Slightly increased damping
+            this.maxParticles = 800;        // Maximum number of particles
+            this.spawnRate = 3;             // Fewer particles per frame
+            this.cellSize = this.h;         // For spatial grid neighbor search
+        }
+
+        // Smoothing Kernels:
+        poly6(r, h) {
+            if (r < 0 || r > h) return 0;
+            const coeff = 315 / (64 * Math.PI * Math.pow(h, 9));
+            return coeff * Math.pow((h * h - r * r), 3);
+        }
+        spikyGradient(r, h) {
+            if (r <= 0 || r > h) return 0;
+            const coeff = -45 / (Math.PI * Math.pow(h, 6));
+            return coeff * Math.pow((h - r), 2);
+        }
+        viscosityLaplacian(r, h) {
+            if (r < 0 || r > h) return 0;
+            const coeff = 45 / (Math.PI * Math.pow(h, 6));
+            return coeff * (h - r);
+        }
+
+        // Build a spatial grid for neighbor search.
+        buildGrid() {
+            const grid = {};
+            for (let i = 0; i < this.particles.length; i++) {
+                const p = this.particles[i];
+                const cx = Math.floor(p.x / this.cellSize);
+                const cy = Math.floor(p.y / this.cellSize);
+                const key = cx + "," + cy;
+                if (!grid[key]) grid[key] = [];
+                grid[key].push(i);
+            }
+            return grid;
+        }
+        getNeighborIndices(grid, cx, cy) {
+            const neighbors = [];
+            for (let dx = -1; dx <= 1; dx++) {
+                for (let dy = -1; dy <= 1; dy++) {
+                    const key = (cx + dx) + "," + (cy + dy);
+                    if (grid[key]) neighbors.push(...grid[key]);
+                }
+            }
+            return neighbors;
+        }
+
+        // Compute density and pressure for each particle.
+        computeDensityPressure() {
+            const grid = this.buildGrid();
+            for (let i = 0; i < this.particles.length; i++) {
+                const p = this.particles[i];
+                const cx = Math.floor(p.x / this.cellSize);
+                const cy = Math.floor(p.y / this.cellSize);
+                const neighbors = this.getNeighborIndices(grid, cx, cy);
+                let density = 0;
+                for (const j of neighbors) {
+                    const pj = this.particles[j];
+                    const dx = p.x - pj.x;
+                    const dy = p.y - pj.y;
+                    const r = Math.hypot(dx, dy);
+                    density += pj.mass * this.poly6(r, this.h);
+                }
+                p.density = density;
+                // Clamp pressure so that only densities above restDensity create repulsion.
+                p.pressure = this.k * Math.max(p.density - this.restDensity, 0);
+            }
+        }
+
+        // Compute pressure and viscosity forces.
+        computeForces() {
+            this.forces = new Array(this.particles.length)
+                .fill(0)
+                .map(() => ({ fx: 0, fy: 0 }));
+            const grid = this.buildGrid();
+            for (let i = 0; i < this.particles.length; i++) {
+                const p = this.particles[i];
+                const cx = Math.floor(p.x / this.cellSize);
+                const cy = Math.floor(p.y / this.cellSize);
+                const neighbors = this.getNeighborIndices(grid, cx, cy);
+                for (const j of neighbors) {
+                    if (j === i) continue;
+                    const pj = this.particles[j];
+                    const dx = p.x - pj.x;
+                    const dy = p.y - pj.y;
+                    const r = Math.hypot(dx, dy);
+                    if (r > this.h || r === 0) continue;
+                    const nx = dx / r;
+                    const ny = dy / r;
+                    const gradW = this.spikyGradient(r, this.h);
+                    // Symmetric pressure force formulation.
+                    const pressureForce = -pj.mass * ((p.pressure / (p.density * p.density)) + (pj.pressure / (pj.density * pj.density))) * gradW;
+                    this.forces[i].fx += pressureForce * nx;
+                    this.forces[i].fy += pressureForce * ny;
+                    // Viscosity force.
+                    const lapW = this.viscosityLaplacian(r, this.h);
+                    const relVx = pj.vx - p.vx;
+                    const relVy = pj.vy - p.vy;
+                    const viscForceX = this.mu * pj.mass * (relVx / pj.density) * lapW;
+                    const viscForceY = this.mu * pj.mass * (relVy / pj.density) * lapW;
+                    this.forces[i].fx += viscForceX;
+                    this.forces[i].fy += viscForceY;
+                }
+                // Add gravity.
+                this.forces[i].fy += p.mass * this.gravity;
+            }
+        }
+
+        // Spawn a Particle over a wider horizontal area.
+        spawnParticle() {
+            const radius = 8;
+            let spawnX = 50 + Math.random() * (this.canvas.width - 100);
+            let spawnY = 20 + Math.random() * 30;
+            // Optionally check for overlap a few times.
+            let attempts = 0;
+            while (attempts < 5) {
+                let overlap = false;
+                for (const p of this.particles) {
+                    if (Math.hypot(p.x - spawnX, p.y - spawnY) < (p.radius + radius + 2)) {
+                        overlap = true;
+                        break;
+                    }
+                }
+                if (!overlap) break;
+                spawnX = 50 + Math.random() * (this.canvas.width - 100);
+                spawnY = 20 + Math.random() * 30;
+                attempts++;
+            }
+            this.particles.push(new Particle(spawnX, spawnY, radius, 0, 0));
+        }
+
+        // A simple collision resolution pass.
+        // This checks nearby particles (using a grid) and gently pushes them apart if they overlap.
+        resolveCollisions() {
+            const cellSize = this.h;
+            const grid = {};
+            // Build grid (similar to before)
+            for (let i = 0; i < this.particles.length; i++) {
+                const p = this.particles[i];
+                const cx = Math.floor(p.x / cellSize);
+                const cy = Math.floor(p.y / cellSize);
+                const key = cx + "," + cy;
+                if (!grid[key]) grid[key] = [];
+                grid[key].push(i);
+            }
+            // Check collisions within each grid cell.
+            for (let key in grid) {
+                const indices = grid[key];
+                for (let i = 0; i < indices.length; i++) {
+                    const a = this.particles[indices[i]];
+                    for (let j = i + 1; j < indices.length; j++) {
+                        const b = this.particles[indices[j]];
+                        const dx = b.x - a.x;
+                        const dy = b.y - a.y;
+                        const dist = Math.hypot(dx, dy);
+                        const minDist = a.radius + b.radius;
+                        if (dist < minDist && dist > 0) {
+                            const overlap = (minDist - dist);
+                            const nx = dx / dist;
+                            const ny = dy / dist;
+                            // Push each particle away by half the overlap.
+                            a.x -= nx * overlap * 0.5;
+                            a.y -= ny * overlap * 0.5;
+                            b.x += nx * overlap * 0.5;
+                            b.y += ny * overlap * 0.5;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Main simulation step.
+        step(dt) {
+            if (this.particles.length < this.maxParticles) {
+                for (let i = 0; i < this.spawnRate; i++) {
+                    this.spawnParticle();
+                }
+            }
+            this.computeDensityPressure();
+            this.computeForces();
+            for (let i = 0; i < this.particles.length; i++) {
+                const p = this.particles[i];
+                const f = this.forces[i];
+                // Semi–implicit Euler integration.
+                p.vx += (f.fx / p.mass) * dt;
+                p.vy += (f.fy / p.mass) * dt;
+                p.x += p.vx * dt;
+                p.y += p.vy * dt;
+                p.vx *= this.damping;
+                p.vy *= this.damping;
+            }
+
+            // Resolve collisions between particles.
+            this.resolveCollisions();
+
+            // Boundary collisions:
+            for (const p of this.particles) {
+                if (p.x - p.radius < 0) {
+                    p.x = p.radius;
+                    p.vx *= -0.5;
+                }
+                if (p.x + p.radius > this.canvas.width) {
+                    p.x = this.canvas.width - p.radius;
+                    p.vx *= -0.5;
+                }
+                if (p.y - p.radius < 0) {
+                    p.y = p.radius;
+                    p.vy *= -0.5;
+                }
+                if (p.y + p.radius > this.canvas.height) {
+                    p.y = this.canvas.height - p.radius;
+                    p.vy *= -0.5;
+                    p.vx *= 0.9;
+                }
+            }
+        }
+
+        render() {
+            this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+            for (const p of this.particles) {
+                p.render(this.ctx);
+            }
+        }
+
+        onResize() { }
+        destroy() { }
+
+        // Optional mouse interaction.
+        addInteraction(x, y, px, py) {
+            const dx = x - px;
+            const dy = y - py;
+            const forceStrength = 150;
+            for (const p of this.particles) {
+                const d = Math.hypot(p.x - x, p.y - y);
+                if (d < 70 && d > 0) {
+                    p.vx += forceStrength * (dx / d) * (1 / d);
+                    p.vy += forceStrength * (dy / d) * (1 / d);
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------
+    // Click Explosion (Optional)
+    // -------------------------------------------------------
+    function clickExplosion(x, y) {
+        const explosionRadius = 150;
+        const explosionForce = 600;
+        for (const p of currentSim.particles) {
+            const dx = p.x - x;
+            const dy = p.y - y;
+            const dist = Math.hypot(dx, dy);
+            if (dist < explosionRadius && dist > 0) {
+                const nx = dx / dist;
+                const ny = dy / dist;
+                const force = explosionForce * (1 - dist / explosionRadius);
+                p.vx += nx * force;
+                p.vy += ny * force;
+            }
+        }
+    }
+
+    // -------------------------------------------------------
+    // Simulation Mode Selector & Initialization
+    // -------------------------------------------------------
+    const simModeSelect = document.getElementById('simMode');
+    simModeSelect.addEventListener('change', () => { initSimulation(simModeSelect.value); });
+    function initSimulation(mode) {
+        if (currentSim && currentSim.destroy) { currentSim.destroy(); }
+        if (mode === 'particle') {
+            currentSim = new ParticleFluidSim(canvas, ctx);
+        }
+    }
+    initSimulation(simModeSelect.value);
+
+    // -------------------------------------------------------
+    // Mouse Interaction & Animation Loop
+    // -------------------------------------------------------
+    let mouseDown = false;
+    let mouseX = 0, mouseY = 0, pmouseX = 0, pmouseY = 0;
+    canvas.addEventListener('mousedown', (e) => {
+        mouseDown = true;
+        mouseX = pmouseX = e.clientX;
+        mouseY = pmouseY = e.clientY;
+    });
+    canvas.addEventListener('mouseup', () => { mouseDown = false; });
+    canvas.addEventListener('mousemove', (e) => {
+        if (!mouseDown) return;
+        pmouseX = mouseX;
+        pmouseY = mouseY;
+        mouseX = e.clientX;
+        mouseY = e.clientY;
+        if (currentSim && currentSim.addInteraction) {
+            currentSim.addInteraction(mouseX, mouseY, pmouseX, pmouseY);
+        }
+    });
+    canvas.addEventListener('click', (e) => {
+        clickExplosion(e.clientX, e.clientY);
+    });
+    document.getElementById('reset').addEventListener('click', () => {
+        if (currentSim && currentSim.particles) {
+            currentSim.particles = [];
+        }
+    });
+    let lastTime = performance.now();
+    function animate() {
+        const now = performance.now();
+        const dt = (now - lastTime) / 1000;
+        lastTime = now;
+        if (currentSim) {
+            currentSim.step(dt);
+            currentSim.render();
+        }
+        requestAnimationFrame(animate);
+    }
+    animate();
+</script>
+</body>
+</html>

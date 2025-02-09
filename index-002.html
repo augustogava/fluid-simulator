@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <title>Fluid Simulation – Stable Fluids in JavaScript</title>
+    <style>
+        /* Fullscreen canvas with no margins */
+        body {
+            margin: 0;
+            overflow: hidden;
+            background: #000;
+        }
+        canvas { display: block; }
+    </style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<script>
+    /*
+      This simulation implements a grid–based fluid solver inspired by Jos Stam’s “Stable Fluids”
+      and SebLague’s fluid simulation series.
+
+      The simulation uses a grid (of resolution N x N) with extra boundary cells. It solves for:
+         - u, v : velocity fields (x and y components)
+         - density : scalar “dye” that is used for visualization
+
+      The simulation loop performs the following steps:
+         1. Add sources (from mouse interactions) to velocity and density.
+         2. Diffuse the velocity fields (simulate viscosity).
+         3. Project (make the velocity field divergence–free).
+         4. Advect the velocity fields (move them along themselves) and re–project.
+         5. Diffuse and advect the density field.
+         6. Render the density (with a hue/lightness modulated by local velocity).
+
+      Feel free to tweak parameters like grid resolution (N), dt, diffusion rates, or source strength.
+    */
+
+    // —–––––––––––––––––––––––––––––––––––––––––––––––––
+    // Simulation Parameters
+    // —–––––––––––––––––––––––––––––––––––––––––––––––––
+    const N = 128;                   // grid resolution (try 64 or 128)
+    const iter = 4;                  // number of relaxation iterations for linear solvers
+    const dt = 0.1;                  // time step
+    const diff = 0.0001;             // diffusion rate for density
+    const visc = 0.0001;             // viscosity (diffusion rate for velocity)
+    const size = (N + 2) * (N + 2);    // total grid cells (including boundaries)
+
+    // —–––––––––––––––––––––––––––––––––––––––––––––––––
+    // Allocate arrays (using Float32Array for performance)
+    // —–––––––––––––––––––––––––––––––––––––––––––––––––
+    let u          = new Float32Array(size);  // x–component of velocity
+    let v          = new Float32Array(size);  // y–component of velocity
+    let u_prev     = new Float32Array(size);
+    let v_prev     = new Float32Array(size);
+    let density    = new Float32Array(size);  // density (dye)
+    let density_prev = new Float32Array(size);
+
+    // —–––––––––––––––––––––––––––––––––––––––––––––––––
+    // Helper: Convert grid coordinates (i,j) to array index
+    // (Grid indices go from 0 to N+1; cells 1..N are “inside”)
+    // —–––––––––––––––––––––––––––––––––––––––––––––––––
+    function IX(i, j) {
+        return i + (N + 2) * j;
+    }
+
+    // —–––––––––––––––––––––––––––––––––––––––––––––––––
+    // Fluid solver routines
+    // —–––––––––––––––––––––––––––––––––––––––––––––––––
+
+    // Adds “source” s into field x
+    function addSource(x, s, dt) {
+        for (let i = 0; i < size; i++) {
+            x[i] += dt * s[i];
+        }
+    }
+
+    // Sets boundary conditions.
+    // b == 1: horizontal velocity; b == 2: vertical velocity; b == 0: scalar (density)
+    function setBoundary(b, x) {
+        for (let i = 1; i <= N; i++) {
+            x[IX(0, i)]     = b === 1 ? -x[IX(1, i)] : x[IX(1, i)];
+            x[IX(N + 1, i)] = b === 1 ? -x[IX(N, i)] : x[IX(N, i)];
+            x[IX(i, 0)]     = b === 2 ? -x[IX(i, 1)] : x[IX(i, 1)];
+            x[IX(i, N + 1)] = b === 2 ? -x[IX(i, N)] : x[IX(i, N)];
+        }
+        x[IX(0, 0)]         = 0.5 * (x[IX(1, 0)] + x[IX(0, 1)]);
+        x[IX(0, N + 1)]     = 0.5 * (x[IX(1, N + 1)] + x[IX(0, N)]);
+        x[IX(N + 1, 0)]     = 0.5 * (x[IX(N, 0)] + x[IX(N + 1, 1)]);
+        x[IX(N + 1, N + 1)] = 0.5 * (x[IX(N, N + 1)] + x[IX(N + 1, N)]);
+    }
+
+    // Diffuse the field x using Gauss–Seidel relaxation.
+    function diffuse(b, x, x0, diff, dt) {
+        const a = dt * diff * N * N;
+        for (let k = 0; k < iter; k++) {
+            for (let j = 1; j <= N; j++) {
+                for (let i = 1; i <= N; i++) {
+                    x[IX(i, j)] =
+                        (x0[IX(i, j)] +
+                            a * (x[IX(i - 1, j)] + x[IX(i + 1, j)] + x[IX(i, j - 1)] + x[IX(i, j + 1)])) /
+                        (1 + 4 * a);
+                }
+            }
+            setBoundary(b, x);
+        }
+    }
+
+    // Advect field d (or velocity) along the velocity field (u, v)
+    function advect(b, d, d0, u, v, dt) {
+        const dt0 = dt * N;
+        for (let j = 1; j <= N; j++) {
+            for (let i = 1; i <= N; i++) {
+                let x = i - dt0 * u[IX(i, j)];
+                let y = j - dt0 * v[IX(i, j)];
+                if (x < 0.5) x = 0.5;
+                if (x > N + 0.5) x = N + 0.5;
+                const i0 = Math.floor(x);
+                const i1 = i0 + 1;
+                if (y < 0.5) y = 0.5;
+                if (y > N + 0.5) y = N + 0.5;
+                const j0 = Math.floor(y);
+                const j1 = j0 + 1;
+                const s1 = x - i0;
+                const s0 = 1 - s1;
+                const t1 = y - j0;
+                const t0 = 1 - t1;
+                d[IX(i, j)] =
+                    s0 * (t0 * d0[IX(i0, j0)] + t1 * d0[IX(i0, j1)]) +
+                    s1 * (t0 * d0[IX(i1, j0)] + t1 * d0[IX(i1, j1)]);
+            }
+        }
+        setBoundary(b, d);
+    }
+
+    // Enforce mass conservation (make velocity field divergence–free)
+    function project(u, v, p, div) {
+        for (let j = 1; j <= N; j++) {
+            for (let i = 1; i <= N; i++) {
+                div[IX(i, j)] =
+                    -0.5 *
+                    (u[IX(i + 1, j)] -
+                        u[IX(i - 1, j)] +
+                        v[IX(i, j + 1)] -
+                        v[IX(i, j - 1)]) / N;
+                p[IX(i, j)] = 0;
+            }
+        }
+        setBoundary(0, div);
+        setBoundary(0, p);
+        for (let k = 0; k < iter; k++) {
+            for (let j = 1; j <= N; j++) {
+                for (let i = 1; i <= N; i++) {
+                    p[IX(i, j)] =
+                        (div[IX(i, j)] +
+                            p[IX(i - 1, j)] +
+                            p[IX(i + 1, j)] +
+                            p[IX(i, j - 1)] +
+                            p[IX(i, j + 1)]) /
+                        4;
+                }
+            }
+            setBoundary(0, p);
+        }
+        for (let j = 1; j <= N; j++) {
+            for (let i = 1; i <= N; i++) {
+                u[IX(i, j)] -= 0.5 * N * (p[IX(i + 1, j)] - p[IX(i - 1, j)]);
+                v[IX(i, j)] -= 0.5 * N * (p[IX(i, j + 1)] - p[IX(i, j - 1)]);
+            }
+        }
+        setBoundary(1, u);
+        setBoundary(2, v);
+    }
+
+    // One full time step of the fluid simulation
+    function step() {
+        // Add sources (from mouse interactions) to velocity and density fields.
+        addSource(u, u_prev, dt);
+        addSource(v, v_prev, dt);
+        addSource(density, density_prev, dt);
+
+        // --- Velocity step ---
+        // Diffuse velocity
+        [u, u_prev] = [u_prev, u]; // swap arrays
+        diffuse(1, u, u_prev, visc, dt);
+        [v, v_prev] = [v_prev, v];
+        diffuse(2, v, v_prev, visc, dt);
+        // Project to enforce incompressibility
+        project(u, v, u_prev, v_prev);
+
+        // Advect velocity
+        [u, u_prev] = [u_prev, u];
+        [v, v_prev] = [v_prev, v];
+        advect(1, u, u_prev, u_prev, v_prev, dt);
+        advect(2, v, v_prev, u_prev, v_prev, dt);
+        project(u, v, u_prev, v_prev);
+
+        // --- Density step ---
+        [density, density_prev] = [density_prev, density];
+        diffuse(0, density, density_prev, diff, dt);
+        [density, density_prev] = [density_prev, density];
+        advect(0, density, density_prev, u, v, dt);
+
+        // Reset the “previous” (source) arrays for next step.
+        for (let i = 0; i < size; i++) {
+            u_prev[i] = 0;
+            v_prev[i] = 0;
+            density_prev[i] = 0;
+        }
+    }
+
+    // —–––––––––––––––––––––––––––––––––––––––––––––––––
+    // Canvas Setup and Rendering
+    // —–––––––––––––––––––––––––––––––––––––––––––––––––
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+    resizeCanvas();
+    window.addEventListener("resize", resizeCanvas);
+    function resizeCanvas() {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+    }
+
+    // Render the density field as colored “water”
+    function render() {
+        // Clear background
+        ctx.fillStyle = "black";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        // Determine the size of each grid cell on the canvas
+        const cellWidth  = canvas.width  / N;
+        const cellHeight = canvas.height / N;
+        // Draw each cell
+        for (let j = 1; j <= N; j++) {
+            for (let i = 1; i <= N; i++) {
+                const d = density[IX(i, j)]; // density value
+                if (d > 0) {
+                    // Compute local velocity magnitude to modulate color brightness.
+                    const vel = Math.sqrt(u[IX(i, j)] ** 2 + v[IX(i, j)] ** 2);
+                    // Map density and velocity into an intensity (clamped to 0..1)
+                    const intensity = Math.min(1, d / 100 + vel * 0.1);
+                    // For a water–like look use a blue hue (around 210°)
+                    // Lightness will vary with intensity.
+                    const lightness = 20 + intensity * 80; // from 20% to 100%
+                    ctx.fillStyle = `hsl(210, 100%, ${lightness}%)`;
+                    ctx.fillRect((i - 1) * cellWidth, (j - 1) * cellHeight, cellWidth, cellHeight);
+                }
+            }
+        }
+    }
+
+    // —–––––––––––––––––––––––––––––––––––––––––––––––––
+    // Mouse / Touch Interaction
+    // —–––––––––––––––––––––––––––––––––––––––––––––––––
+    let mouseDown = false;
+    let mouseX = 0, mouseY = 0, pmouseX = 0, pmouseY = 0;
+
+    canvas.addEventListener("mousedown", (e) => {
+        mouseDown = true;
+        mouseX = e.clientX;
+        mouseY = e.clientY;
+        pmouseX = e.clientX;
+        pmouseY = e.clientY;
+    });
+    canvas.addEventListener("mouseup", () => {
+        mouseDown = false;
+    });
+    canvas.addEventListener("mousemove", (e) => {
+        if (!mouseDown) return;
+        pmouseX = mouseX;
+        pmouseY = mouseY;
+        mouseX = e.clientX;
+        mouseY = e.clientY;
+        addInteraction(mouseX, mouseY, pmouseX, pmouseY);
+    });
+
+    // When the mouse is dragged, add density and velocity to the simulation.
+    function addInteraction(x, y, px, py) {
+        // Convert canvas coordinates to simulation grid indices (1 ... N)
+        const i = Math.floor((x / canvas.width) * N + 1);
+        const j = Math.floor((y / canvas.height) * N + 1);
+        if (i < 1 || i > N || j < 1 || j > N) return;
+        const index = IX(i, j);
+        // Add a burst of density (“dye”)
+        density_prev[index] = 100;
+        // Add velocity in the direction of the mouse movement.
+        const force = 5;
+        u_prev[index] = force * (x - px);
+        v_prev[index] = force * (y - py);
+    }
+
+    // —–––––––––––––––––––––––––––––––––––––––––––––––––
+    // Animation Loop
+    // —–––––––––––––––––––––––––––––––––––––––––––––––––
+    function animate() {
+        step();
+        render();
+        requestAnimationFrame(animate);
+    }
+    animate();
+</script>
+</body>
+</html>
